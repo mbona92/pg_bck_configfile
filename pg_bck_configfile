@@ -1,0 +1,213 @@
+#!/bin/bash
+
+check_ssh_connection() {
+	if ! errmsg=$(ssh -o LogLevel=error -o BatchMode=yes -o ConnectTimeout=5 ${osuser}@${oshost} echo Connect! 2>&1) ; then
+		log DIE "Cannot ssh connect to database host using command \"ssh ${osuser}@${oshost}\"! Command failed with: ${errmsg}"
+	fi
+}
+
+bck_config_file() {
+	check_ssh_connection
+	cd ${bckdir}
+	if [ ! -d .git ] || ! git rev-parse --git-dir > /dev/null 2>&1 ; then
+		git init ${bckdir}
+	fi
+	if ! git config --list | grep -Eqs '^user\.name=' || ! git config --list | grep -Eqs '^user\.email='; then
+		log DIE "user.name or user.email are not configured!\nRun 'git config --global user.email \"you@example.com\"' or 'git config --global user.name \"Your Name\"'"
+	fi
+	scp ${osuser}@${oshost}:${config_file} ${bckdir}/
+	e_status+=$?
+	scp ${osuser}@${oshost}:${hba_file} ${bckdir}/
+	e_status+=$?
+	scp ${osuser}@${oshost}:${ident_file} ${bckdir}/
+	e_status+=$?
+	scp ${osuser}@${oshost}:${data_directory}/postgresql.auto.conf ${bckdir}/
+	e_status+=$?
+	if [ "${is_in_recovery}" == 't' ]; then
+		scp ${osuser}@${oshost}:${data_directory}/recovery.conf ${bckdir}/
+		e_status+=$?
+	fi
+	modified_files=$(git ls-files -m)
+	git add .
+	e_status=+$?
+	new_files=$(git status --porcelain | grep -E '^A' | awk '{print $NF}')
+	if [ -n "${new_files}" ] || [ -n "${modified_files}" ]; then
+		git commit -m "Config file at $(date +'%Y-%m-%d %H:%M')"
+		e_status=+$?
+	fi
+	if [ ${e_status} -gt 0 ]; then
+		log DIE "ERROR: Somethings went wrong backing up configuration files!"
+	fi
+	cd - > /dev/null
+}
+
+make_db_conn() {
+	conn_string="-d ${1} -h ${2} -U ${3} -p ${4}"
+	if ! errmsg=$(PGPASSWORD=${pgpassword} psql -w ${conn_string} ${psql_out_opt} -c "select 1" 2>&1) ; then
+		log ERR "Unable to connect to database ${db}! Error was: ${errmsg}"
+		exit 1
+	fi
+	is_in_recovery=$(PGPASSWORD=${pgpassword} psql -w ${conn_string} ${psql_out_opt} -c "select pg_is_in_recovery()")
+	echo ${conn_string}
+}
+
+usage() { 
+	echo "Usage:"
+	echo "   $(basename $0) [OPTION]"
+	echo
+	echo "Options:"
+	echo "  -b, --bck-dir    where to backup config files"
+	echo "  -l               log directory"
+	echo ""
+	echo "  --help           display this help"
+	echo ""
+	echo "Database connection options:"
+	echo "  -d               connect to database name"
+	echo "  -h               database server host or socket directory"
+	echo "  -p               database server port number"
+	echo "  -U               connect as specified database user"
+	echo "  -P               if specified, prompt for postgres user's password"
+	echo ""
+	echo "Server connection options:"
+	echo "  --host           server host to connect to copy config file"
+	echo "  --user           os user used to connect to server host"
+	echo 
+}
+
+declare -i r_jobs=0
+declare -i max_jobs=1
+declare -i f_pgpwd=0
+wdir=$(realpath $( dirname $0 ))
+pgdb=${PGDATABASE:-postgres}
+pghost=${PGHOST:-localhost}
+pgport=${PGPORT:-5432}
+pguser=${PGUSER:-${USER}}
+psql_out_opt="-A -t -X"
+
+# Load bash_lib containig some useful function
+if ! source ${wdir}/bash_lib; then
+	echo "Cannot load ${wdir}/bash_lib file!"
+	exit 1
+fi
+
+if [[ ${#} -lt 1 ]]; then
+	usage
+	exit 1
+fi
+
+while [[ ${#} -ge 1 ]]
+do
+	arg=${1}
+	case ${arg} in
+		-b|--bck-dir)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			# bckdir=$(realpath "${1}")
+			bckdir="${1}"
+			shift
+			;;
+		-l)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			logdir="${1}"
+			shift
+			;;
+		-d)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			pgdb="${1}"
+			shift
+			;;
+		-h)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			pghost="${1}"
+			shift
+			;;
+		-p)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			pgport="${1}"
+			shift
+			;;
+		-U)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			pguser="${1}"
+			shift
+			;;
+		-P)
+			shift
+			f_pgpwd=1
+			;;
+		--host)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			oshost="${1}"
+			shift
+			;;
+		--user)
+			shift
+			[ -z "${1}" ] && log -p "$(basename ${0}): " DIE "${arg}: missing arguments"
+			osuser="${1}"
+			shift
+			;;
+		--help)
+			usage
+			exit
+			;;
+		*)
+			log ERR "Option ${arg} not found!"
+			usage
+			exit 1
+			;;
+	esac
+done
+
+# If osuser or oshost are not specified, assume that are the same of pguser and pghost
+[ -z "${osuser}" ] && osuser=${pguser}
+[ -z "${oshost}" ] && oshost=${pghost}
+
+# Prompt for password if -P is specified
+if [ ${f_pgpwd} -eq 1 ]; then
+	echo -n "Insert password for user ${pguser}: "
+	read -s pgpassword
+	echo
+fi
+
+# Check db connection
+conn_string=$(make_db_conn ${pgdb} ${pghost} ${pguser} ${pgport})
+[ $? -gt 0 ] && exit 1
+# backup directory must be specified
+if [ -z "${bckdir}" ]; then
+	log DIE "You have to specify backup directory!"
+else
+	# create bckdir if not exist
+	if [ ! -d "${bckdir}" ]; then
+		if ! errmsg=$(mkdir -p ${bckdir} 2>&1); then
+			log DIE "Failed to create \"${bckdir}\"! Error was: ${errmsg}"
+		fi
+	fi
+	bckdir=$(realpath ${bckdir})
+fi
+# if logdir is empty save log file in current directory
+if [ -z "${logdir}" ]; then
+	logdir=${PWD}
+else
+	# create logdir if not exist
+	if [ ! -d "${logdir}" ]; then
+		if ! errmsg=$(mkdir -p ${logdir} 2>&1); then
+			log DIE "Failed to create \"${logdir}\"! Error was: ${errmsg}"
+		fi
+	fi
+	logdir=$(realpath ${logdir})
+fi
+
+exec > ${logdir}/$(basename ${0}).log 2>&1
+
+config_file=$(PGPASSWORD=${pgpassword} psql -w ${conn_string} ${psql_out_opt} -c "show config_file")
+hba_file=$(PGPASSWORD=${pgpassword} psql -w ${conn_string} ${psql_out_opt} -c "show hba_file")
+ident_file=$(PGPASSWORD=${pgpassword} psql -w ${conn_string} ${psql_out_opt} -c "show ident_file")
+data_directory=$(PGPASSWORD=${pgpassword} psql -w ${conn_string} ${psql_out_opt} -c "show data_directory")
+
+bck_config_file
